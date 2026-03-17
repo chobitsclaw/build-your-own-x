@@ -1,4 +1,4 @@
-name: Sync upstream
+name: Check upstream updates
 
 on:
   schedule:
@@ -6,10 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+  issues: write
 
 jobs:
-  sync:
+  check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout fork
@@ -17,13 +18,103 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Sync default branch from upstream
+      - name: Check upstream delta
+        id: delta
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/codecrafters-io/build-your-own-x.git || true
           git fetch upstream master
-          git checkout master
-          git merge --ff-only upstream/master
-          git push origin master
+          LOCAL_SHA=$(git rev-parse HEAD)
+          UPSTREAM_SHA=$(git rev-parse upstream/master)
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/master)
+          echo "local_sha=$LOCAL_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "behind_count=$BEHIND_COUNT" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND_COUNT" -gt 0 ]; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Find existing reminder issue
+        if: steps.delta.outputs.has_updates == 'true'
+        id: find_issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              labels: 'upstream-sync-reminder'
+            });
+            const hit = issues.find(i => (i.title || '').includes('Upstream updates available'));
+            core.setOutput('issue_number', hit ? String(hit.number) : '');
+
+      - name: Create reminder issue
+        if: steps.delta.outputs.has_updates == 'true' && steps.find_issue.outputs.issue_number == ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const behind = `${{ steps.delta.outputs.behind_count }}`;
+            const upstreamSha = `${{ steps.delta.outputs.upstream_sha }}`;
+            const localSha = `${{ steps.delta.outputs.local_sha }}`;
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title: 'Upstream updates available',
+              labels: ['upstream-sync-reminder'],
+              body: [
+                '上游 `codecrafters-io/build-your-own-x` 有新提交可同步。',
+                '',
+                `- 当前 fork HEAD: \`${localSha}\``,
+                `- 上游 master: \`${upstreamSha}\``,
+                `- 落后提交数: **${behind}**`,
+                '',
+                '当前策略是 **只提醒，不自动合并**。',
+                '如需同步，请手动执行 merge/rebase，或手动运行 workflow 后再处理。'
+              ].join('\n')
+            });
+
+      - name: Update existing reminder issue
+        if: steps.delta.outputs.has_updates == 'true' && steps.find_issue.outputs.issue_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = Number(`${{ steps.find_issue.outputs.issue_number }}`);
+            const behind = `${{ steps.delta.outputs.behind_count }}`;
+            const upstreamSha = `${{ steps.delta.outputs.upstream_sha }}`;
+            const localSha = `${{ steps.delta.outputs.local_sha }}`;
+            await github.rest.issues.update({
+              owner,
+              repo,
+              issue_number,
+              body: [
+                '上游 `codecrafters-io/build-your-own-x` 仍有新提交可同步。',
+                '',
+                `- 当前 fork HEAD: \`${localSha}\``,
+                `- 上游 master: \`${upstreamSha}\``,
+                `- 落后提交数: **${behind}**`,
+                '',
+                '当前策略是 **只提醒，不自动合并**。'
+              ].join('\n')
+            });
+
+      - name: Close reminder issue when up to date
+        if: steps.delta.outputs.has_updates == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              labels: 'upstream-sync-reminder'
+            });
+            for (const issue of issues) {
+              await github.rest.issues.update({ owner, repo, issue_number: issue.number, state: 'closed' });
+            }
